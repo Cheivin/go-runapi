@@ -445,9 +445,12 @@ func (p *Parser) parseFuncDoc(doc *ast.CommentGroup, filePath string) (*types.AP
 						requireStr = "false"
 					}
 
+					// 对于请求体参数，需要从Go类型映射到请求类型
+					// 这里应该从原始Go类型映射，而不是从已经映射过的类型再次映射
+					goType := p.getOriginalGoType(structKey, field.Name)
 					requestParam := types.RequestParam{
 						Name:    field.Name,
-						Type:    p.mapGoTypeToRequestType(field.Type),
+						Type:    p.mapGoTypeToRequestType(goType),
 						Require: requireStr,
 						Remark:  field.Remark,
 					}
@@ -504,7 +507,7 @@ func (p *Parser) extractJSONTagInfo(tagStr string) (string, bool, bool) {
 	if strings.HasPrefix(jsonPart, "json:") {
 		jsonTag := strings.Trim(jsonPart[5:], "\"")
 		if jsonTag == "-" {
-			return "-", false, false // 跳过不序列化的字段
+			return "-", false, true // 跳过不序列化的字段
 		}
 
 		var fieldName string
@@ -671,6 +674,10 @@ func (p *Parser) parseNestedResponse(responseValue string, filePath string) ([]t
 	// 首先添加基础结构体的字段
 	if structInfo, exists := p.structInfos[baseStructKey]; exists {
 		for _, field := range structInfo.Fields {
+			// 跳过被标记为 - 的字段（不序列化的字段）
+			if field.Name == "-" {
+				continue
+			}
 			params = append(params, field)
 		}
 	}
@@ -746,14 +753,62 @@ func (p *Parser) deepParseStruct(structName string, prefix string) []types.Respo
 	}
 
 	for _, field := range structInfo.Fields {
+		// 跳过被标记为 - 的字段（不序列化的字段）
+		if field.Name == "-" {
+			continue
+		}
+
 		// 检查是否是嵌入字段（字段名和类型相同）
 		isEmbedded := (field.Name == field.Type)
 
 		// 清理字段类型，移除指针符号
 		cleanType := strings.TrimPrefix(field.Type, "*")
 
-		// 检查字段类型是否是已知的结构体
-		if _, isStruct := p.structInfos[cleanType]; isStruct {
+		// 处理数组类型
+		if strings.HasPrefix(cleanType, "[]") {
+			// 获取数组元素类型
+			elementType := strings.TrimPrefix(cleanType, "[]")
+
+			// 添加数组字段本身
+			if !isEmbedded {
+				param := types.ResponseParam{
+					Name:     prefix + field.Name,
+					Type:     "array",
+					Required: field.Required,
+					Remark:   field.Remark,
+				}
+				params = append(params, param)
+			}
+
+			// 检查数组元素是否是结构体
+			if _, isStruct := p.structInfos[elementType]; isStruct {
+				// 递归解析数组元素结构体，使用普通的点号分隔
+				arrayPrefix := prefix + field.Name + "."
+				nestedParams := p.deepParseStruct(elementType, arrayPrefix)
+				params = append(params, nestedParams...)
+			} else if strings.Contains(elementType, ".") {
+				// 尝试解析带包名的结构体
+				for key := range p.structInfos {
+					if strings.HasSuffix(key, "."+elementType) || key == elementType {
+						// 递归解析数组元素结构体
+						arrayPrefix := prefix + field.Name + "."
+						nestedParams := p.deepParseStruct(key, arrayPrefix)
+						params = append(params, nestedParams...)
+						break
+					}
+				}
+			} else {
+				// 尝试在同一包内查找结构体
+				currentPackage := structInfo.Package
+				prefixedKey := currentPackage + "." + elementType
+				if _, isStruct := p.structInfos[prefixedKey]; isStruct {
+					// 递归解析数组元素结构体
+					arrayPrefix := prefix + field.Name + "."
+					nestedParams := p.deepParseStruct(prefixedKey, arrayPrefix)
+					params = append(params, nestedParams...)
+				}
+			}
+		} else if _, isStruct := p.structInfos[cleanType]; isStruct {
 			// 递归解析嵌套结构体
 			fieldPrefix := prefix
 			if !isEmbedded {
@@ -855,6 +910,22 @@ func (p *Parser) mapGoTypeToRequestType(goType string) string {
 		// 对于自定义结构体，返回object
 		return "object"
 	}
+}
+
+// getOriginalGoType 获取结构体字段的原始Go类型
+func (p *Parser) getOriginalGoType(structKey, fieldName string) string {
+	structInfo, exists := p.structInfos[structKey]
+	if !exists {
+		return "object" // 默认返回object
+	}
+
+	for _, field := range structInfo.Fields {
+		if field.Name == fieldName {
+			return field.Type
+		}
+	}
+
+	return "object" // 默认返回object
 }
 
 // mapGoTypeToResponseType 将Go类型映射到响应参数类型
