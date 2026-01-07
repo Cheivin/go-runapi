@@ -41,5 +41,13 @@ type StructInfo struct {
 	Name        string
 	Package     string // 结构体所属的包名
 	PackagePath string // 包的完整路径
-	Fields      []ResponseParam
+	Fields      []FieldInfo
+}
+
+// FieldInfo 表示结构体字段的完整信息
+type FieldInfo struct {
+	Name     string // 字段名
+	Type     string // Go类型
+	Required bool   // 是否必传（基于omitempty标签）
+	Remark   string // 字段注释
 }

@@ -124,8 +124,12 @@ func (p *Parser) parseStructsInDir(dir string) error {
 		}
 
 		// 跳过vendor目录（除非明确包含）
-		if !p.includeVendor && strings.Contains(path, "vendor/") {
-			return nil
+		if !p.includeVendor {
+			// 只跳过标准的 vendor/ 目录，不跳过 private-vendor 等自定义 vendor 目录
+			// 检查路径中是否包含 /vendor/ 或以 /vendor 开头
+			if strings.Contains(path, "/vendor/") || strings.HasPrefix(strings.TrimPrefix(path, "./"), "vendor/") {
+				return nil
+			}
 		}
 
 		if !strings.HasSuffix(path, ".go") || strings.HasSuffix(path, "_test.go") {
@@ -164,13 +168,53 @@ func (p *Parser) parseStructsInDir(dir string) error {
 					continue
 				}
 
+				// 使用包名+结构体名作为key
+				key := packageName + "." + typeSpec.Name.Name
+
+				// 检查是否是类型别名（type alias）
+				if aliasType, isAlias := p.getTypeAlias(typeSpec.Type); isAlias {
+					// 对于类型别名，创建一个指向实际类型的引用
+					structInfo := types.StructInfo{
+						Name:        typeSpec.Name.Name,
+						Package:     packageName,
+						PackagePath: relPath,
+						// 标记这是一个类型别名
+					}
+
+					// 解析实际类型
+					actualTypeKey, err := p.resolveStructReference(aliasType, path)
+					if err != nil {
+						// 如果解析失败，尝试直接查找
+						actualTypeKey = aliasType
+					}
+
+					// 如果找到了实际类型，将实际类型的字段复制过来
+					if actualStructInfo, exists := p.structInfos[actualTypeKey]; exists {
+						// 复制实际类型的字段
+						structInfo.Fields = make([]types.FieldInfo, len(actualStructInfo.Fields))
+						copy(structInfo.Fields, actualStructInfo.Fields)
+					} else {
+						// 如果找不到实际类型，添加一个占位符，稍后在 deepParseStruct 中会尝试解析
+						structInfo.Fields = []types.FieldInfo{
+							{
+								Name:     aliasType,
+								Type:     aliasType,
+								Required: false,
+								Remark:   "类型别名指向: " + aliasType,
+							},
+						}
+					}
+
+					p.structInfos[key] = structInfo
+					continue
+				}
+
+				// 处理普通结构体
 				structType, ok := typeSpec.Type.(*ast.StructType)
 				if !ok {
 					continue
 				}
 
-				// 使用包名+结构体名作为key
-				key := packageName + "." + typeSpec.Name.Name
 				structInfo := types.StructInfo{
 					Name:        typeSpec.Name.Name,
 					Package:     packageName,
@@ -181,7 +225,7 @@ func (p *Parser) parseStructsInDir(dir string) error {
 					if len(field.Names) == 0 {
 						// 嵌入字段（匿名字段）
 						fieldType := p.getTypeString(field.Type)
-						param := types.ResponseParam{
+						fieldInfo := types.FieldInfo{
 							Name:     fieldType,
 							Type:     fieldType,
 							Required: true, // 嵌入字段默认必传
@@ -191,15 +235,20 @@ func (p *Parser) parseStructsInDir(dir string) error {
 						// 提取字段注释
 						if field.Comment != nil {
 							for _, comment := range field.Comment.List {
-								param.Remark = strings.TrimSpace(strings.TrimPrefix(comment.Text, "//"))
+								fieldInfo.Remark = strings.TrimSpace(strings.TrimPrefix(comment.Text, "//"))
 							}
 						}
 
-						structInfo.Fields = append(structInfo.Fields, param)
+						structInfo.Fields = append(structInfo.Fields, fieldInfo)
 					} else {
 						// 普通字段
 						for _, name := range field.Names {
-							param := types.ResponseParam{
+							// 跳过未导出的字段（小写字母开头）
+							if !isExported(name.Name) {
+								continue
+							}
+
+							fieldInfo := types.FieldInfo{
 								Name: name.Name,
 								Type: p.getTypeString(field.Type),
 							}
@@ -211,19 +260,19 @@ func (p *Parser) parseStructsInDir(dir string) error {
 									if jsonName == "-" {
 										continue // 跳过不序列化的字段
 									}
-									param.Name = jsonName
-									param.Required = !omitempty // 有omitempty则为非必传，否则为必传
+									fieldInfo.Name = jsonName
+									fieldInfo.Required = !omitempty // 有omitempty则为非必传，否则为必传
 								}
 							}
 
 							// 提取字段注释
 							if field.Comment != nil {
 								for _, comment := range field.Comment.List {
-									param.Remark = strings.TrimSpace(strings.TrimPrefix(comment.Text, "//"))
+									fieldInfo.Remark = strings.TrimSpace(strings.TrimPrefix(comment.Text, "//"))
 								}
 							}
 
-							structInfo.Fields = append(structInfo.Fields, param)
+							structInfo.Fields = append(structInfo.Fields, fieldInfo)
 						}
 					}
 				}
@@ -446,8 +495,8 @@ func (p *Parser) parseFuncDoc(doc *ast.CommentGroup, filePath string) (*types.AP
 					}
 
 					// 对于请求体参数，需要从Go类型映射到请求类型
-					// 这里应该从原始Go类型映射，而不是从已经映射过的类型再次映射
-					goType := p.getOriginalGoType(structKey, field.Name)
+					// 使用辅助方法获取原始Go类型
+					goType := p.getFieldOriginalGoType(structKey, field.Name)
 					requestParam := types.RequestParam{
 						Name:    field.Name,
 						Type:    p.mapGoTypeToRequestType(goType),
@@ -458,6 +507,7 @@ func (p *Parser) parseFuncDoc(doc *ast.CommentGroup, filePath string) (*types.AP
 				}
 			} else {
 				fmt.Printf("警告: 未找到结构体 %s (原始: %s)\n", structKey, bodyType)
+				fmt.Printf("可用的结构体: %v\n", p.getAvailableStructs())
 			}
 		}
 	}
@@ -503,30 +553,88 @@ func (p *Parser) extractJSONTagInfo(tagStr string) (string, bool, bool) {
 		return "", false, false
 	}
 
-	jsonPart := parts[0]
-	if strings.HasPrefix(jsonPart, "json:") {
-		jsonTag := strings.Trim(jsonPart[5:], "\"")
-		if jsonTag == "-" {
-			return "-", false, true // 跳过不序列化的字段
+	// 遍历所有 tag 部分，查找 json: 开头的部分
+	for _, part := range parts {
+		if strings.HasPrefix(part, "json:") {
+			jsonTag := strings.Trim(part[5:], "\"")
+			if jsonTag == "-" {
+				return "-", false, true // 跳过不序列化的字段
+			}
+
+			var fieldName string
+			var omitempty bool
+
+			// 解析逗号分隔的选项
+			if commaIndex := strings.Index(jsonTag, ","); commaIndex != -1 {
+				fieldName = jsonTag[:commaIndex]
+				options := jsonTag[commaIndex+1:]
+				omitempty = strings.Contains(options, "omitempty")
+			} else {
+				fieldName = jsonTag
+				omitempty = false
+			}
+
+			return fieldName, omitempty, true
 		}
-
-		var fieldName string
-		var omitempty bool
-
-		// 解析逗号分隔的选项
-		if commaIndex := strings.Index(jsonTag, ","); commaIndex != -1 {
-			fieldName = jsonTag[:commaIndex]
-			options := jsonTag[commaIndex+1:]
-			omitempty = strings.Contains(options, "omitempty")
-		} else {
-			fieldName = jsonTag
-			omitempty = false
-		}
-
-		return fieldName, omitempty, true
 	}
 
 	return "", false, false
+}
+
+// isExported 检查标识符是否为导出的（大写字母开头）
+func isExported(name string) bool {
+	if len(name) == 0 {
+		return false
+	}
+	return name[0] >= 'A' && name[0] <= 'Z'
+}
+
+// getTypeAlias 检测类型别名并返回别名指向的类型
+// 如果是类型别名（type X = Y），返回 Y；否则返回空字符串
+func (p *Parser) getTypeAlias(expr ast.Expr) (string, bool) {
+	// 检查是否是标识符（如 type DeleteRequest = IdRequest）
+	if ident, ok := expr.(*ast.Ident); ok {
+		// 如果标识符不是基本类型，可能是类型别名
+		if !p.isBasicType(ident.Name) {
+			return ident.Name, true
+		}
+	}
+
+	// 检查是否是选择器表达式（如 type DeleteRequest = common2.IdRequest）
+	if selector, ok := expr.(*ast.SelectorExpr); ok {
+		aliasType := p.getTypeString(selector)
+		return aliasType, true
+	}
+
+	// 检查是否是结构体类型
+	if _, ok := expr.(*ast.StructType); ok {
+		return "", false
+	}
+
+	return "", false
+}
+
+// isBasicType 检查是否是基本类型
+func (p *Parser) isBasicType(name string) bool {
+	basicTypes := map[string]bool{
+		"string":  true,
+		"int":     true,
+		"int8":    true,
+		"int16":   true,
+		"int32":   true,
+		"int64":   true,
+		"uint":    true,
+		"uint8":   true,
+		"uint16":  true,
+		"uint32":  true,
+		"uint64":  true,
+		"float32": true,
+		"float64": true,
+		"bool":    true,
+		"byte":    true,
+		"rune":    true,
+	}
+	return basicTypes[name]
 }
 
 // getTypeString 获取类型字符串
@@ -678,7 +786,13 @@ func (p *Parser) parseNestedResponse(responseValue string, filePath string) ([]t
 			if field.Name == "-" {
 				continue
 			}
-			params = append(params, field)
+			// 将 FieldInfo 转换为 ResponseParam
+			params = append(params, types.ResponseParam{
+				Name:     field.Name,
+				Type:     p.mapGoTypeToResponseType(field.Type),
+				Required: field.Required,
+				Remark:   field.Remark,
+			})
 		}
 	}
 
@@ -758,7 +872,7 @@ func (p *Parser) deepParseStruct(structName string, prefix string) []types.Respo
 			continue
 		}
 
-		// 检查是否是嵌入字段（字段名和类型相同）
+		// 检查是否是嵌入字段（字段名和类型相同，或者字段名包含点号表示已经展开的）
 		isEmbedded := (field.Name == field.Type)
 
 		// 清理字段类型，移除指针符号
@@ -810,29 +924,89 @@ func (p *Parser) deepParseStruct(structName string, prefix string) []types.Respo
 			}
 		} else if _, isStruct := p.structInfos[cleanType]; isStruct {
 			// 递归解析嵌套结构体
+			// 对于嵌入字段，使用当前前缀；对于普通字段，添加字段名作为前缀
 			fieldPrefix := prefix
 			if !isEmbedded {
+				// 对于普通字段，先添加对象字段本身
+				param := types.ResponseParam{
+					Name:     prefix + field.Name,
+					Type:     "object",
+					Required: field.Required,
+					Remark:   field.Remark,
+				}
+				params = append(params, param)
 				fieldPrefix = prefix + field.Name + "."
 			}
+			// 递归解析嵌套结构体的字段
 			nestedParams := p.deepParseStruct(cleanType, fieldPrefix)
 			params = append(params, nestedParams...)
 		} else {
 			// 检查是否是带包名的结构体引用
-			if strings.Contains(cleanType, ".") {
+			if strings.Contains(field.Type, ".") {
 				// 尝试解析带包名的结构体
 				found := false
 				for key := range p.structInfos {
-					if strings.HasSuffix(key, "."+cleanType) || key == cleanType {
+					// 尝试多种匹配方式
+					if key == field.Type || strings.HasSuffix(key, "."+cleanType) {
 						// 递归解析嵌套结构体
 						fieldPrefix := prefix
 						if !isEmbedded {
+							// 对于普通字段，先添加对象字段本身
+							param := types.ResponseParam{
+								Name:     prefix + field.Name,
+								Type:     "object",
+								Required: field.Required,
+								Remark:   field.Remark,
+							}
+							params = append(params, param)
 							fieldPrefix = prefix + field.Name + "."
 						}
+						// 递归解析嵌套结构体的字段
 						nestedParams := p.deepParseStruct(key, fieldPrefix)
 						params = append(params, nestedParams...)
 						found = true
 						break
 					}
+				}
+				// 如果没有找到，尝试去除包名中的数字后缀
+				if !found {
+					// 提取包名和类型名
+					parts := strings.Split(field.Type, ".")
+					if len(parts) == 2 {
+						packageName := parts[0]
+						typeName := parts[1]
+						// 去除包名中的数字后缀
+						trimmedPackageName := strings.TrimSuffix(packageName, "2")
+						trimmedPackageName = strings.TrimSuffix(trimmedPackageName, "3")
+						trimmedPackageName = strings.TrimSuffix(trimmedPackageName, "4")
+						trimmedPackageName = strings.TrimSuffix(trimmedPackageName, "5")
+						trimmedKey := trimmedPackageName + "." + typeName
+						// 尝试查找去除数字后缀的包名
+						if _, exists := p.structInfos[trimmedKey]; exists {
+							// 递归解析嵌套结构体
+							fieldPrefix := prefix
+							if !isEmbedded {
+								// 对于普通字段，先添加对象字段本身
+								param := types.ResponseParam{
+									Name:     prefix + field.Name,
+									Type:     "object",
+									Required: field.Required,
+									Remark:   field.Remark,
+								}
+								params = append(params, param)
+								fieldPrefix = prefix + field.Name + "."
+							}
+							// 递归解析嵌套结构体的字段
+							nestedParams := p.deepParseStruct(trimmedKey, fieldPrefix)
+							params = append(params, nestedParams...)
+							found = true
+						}
+					}
+				}
+				// 如果没有找到，打印警告信息
+				if !found && isEmbedded {
+					fmt.Printf("警告: 嵌入字段 %s 未找到匹配的结构体 (cleanType=%s, field.Type=%s)\n", field.Name, cleanType, field.Type)
+					fmt.Printf("可用的结构体: %v\n", p.getAvailableStructs())
 				}
 				if !found {
 					// 只有非嵌入字段才添加到参数列表
@@ -854,8 +1028,17 @@ func (p *Parser) deepParseStruct(structName string, prefix string) []types.Respo
 					// 递归解析嵌套结构体
 					fieldPrefix := prefix
 					if !isEmbedded {
+						// 对于普通字段，先添加对象字段本身
+						param := types.ResponseParam{
+							Name:     prefix + field.Name,
+							Type:     "object",
+							Required: field.Required,
+							Remark:   field.Remark,
+						}
+						params = append(params, param)
 						fieldPrefix = prefix + field.Name + "."
 					}
+					// 递归解析嵌套结构体的字段
 					nestedParams := p.deepParseStruct(prefixedKey, fieldPrefix)
 					params = append(params, nestedParams...)
 				} else {
@@ -912,16 +1095,94 @@ func (p *Parser) mapGoTypeToRequestType(goType string) string {
 	}
 }
 
-// getOriginalGoType 获取结构体字段的原始Go类型
+// getFieldOriginalGoType 从 FieldInfo 列表中获取结构体字段的原始Go类型
+func (p *Parser) getFieldOriginalGoType(structKey, fieldName string) string {
+	structInfo, exists := p.structInfos[structKey]
+	if !exists {
+		return "object" // 默认返回object
+	}
+
+	// 首先在当前结构体的字段中查找
+	for _, field := range structInfo.Fields {
+		if field.Name == fieldName {
+			return field.Type
+		}
+	}
+
+	// 如果在当前结构体中找不到，检查嵌入字段
+	for _, field := range structInfo.Fields {
+		// 检查是否是嵌入字段（字段名和类型相同）
+		if field.Name == field.Type {
+			// 清理类型，移除指针符号
+			cleanType := strings.TrimPrefix(field.Type, "*")
+			// 尝试直接查找
+			if nestedType := p.getFieldOriginalGoType(cleanType, fieldName); nestedType != "object" {
+				return nestedType
+			}
+			// 如果找不到，尝试去除包名中的数字后缀
+			if strings.Contains(cleanType, ".") {
+				parts := strings.Split(cleanType, ".")
+				if len(parts) == 2 {
+					packageName := parts[0]
+					typeName := parts[1]
+					// 去除包名中的数字后缀
+					trimmedPackageName := strings.TrimSuffix(packageName, "2")
+					trimmedPackageName = strings.TrimSuffix(trimmedPackageName, "3")
+					trimmedPackageName = strings.TrimSuffix(trimmedPackageName, "4")
+					trimmedPackageName = strings.TrimSuffix(trimmedPackageName, "5")
+					trimmedKey := trimmedPackageName + "." + typeName
+					// 尝试查找去除数字后缀的包名
+					if nestedType := p.getFieldOriginalGoType(trimmedKey, fieldName); nestedType != "object" {
+						return nestedType
+					}
+				}
+			}
+		}
+	}
+
+	return "object" // 默认返回object
+}
+
+// getOriginalGoType 获取结构体字段的原始Go类型（已废弃，保留用于兼容）
 func (p *Parser) getOriginalGoType(structKey, fieldName string) string {
 	structInfo, exists := p.structInfos[structKey]
 	if !exists {
 		return "object" // 默认返回object
 	}
 
+	// 首先在当前结构体的字段中查找
 	for _, field := range structInfo.Fields {
 		if field.Name == fieldName {
 			return field.Type
+		}
+	}
+
+	// 如果在当前结构体中找不到，检查嵌入字段
+	for _, field := range structInfo.Fields {
+		// 检查是否是嵌入字段（字段名和类型相同）
+		if field.Name == field.Type {
+			// 清理类型，移除指针符号和包名前缀
+			cleanType := strings.TrimPrefix(field.Type, "*")
+			// 如果类型包含包名前缀，尝试查找完整路径
+			if strings.Contains(cleanType, ".") {
+				// 尝试直接使用完整类型名查找
+				if nestedType := p.getOriginalGoType(cleanType, fieldName); nestedType != "object" {
+					return nestedType
+				}
+				// 如果找不到，尝试在当前包中查找
+				parts := strings.Split(cleanType, ".")
+				typeName := parts[len(parts)-1]
+				currentPackage := structInfo.Package
+				prefixedKey := currentPackage + "." + typeName
+				if nestedType := p.getOriginalGoType(prefixedKey, fieldName); nestedType != "object" {
+					return nestedType
+				}
+			} else {
+				// 递归查找嵌入结构体中的字段
+				if nestedType := p.getOriginalGoType(cleanType, fieldName); nestedType != "object" {
+					return nestedType
+				}
+			}
 		}
 	}
 

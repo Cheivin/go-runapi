@@ -139,11 +139,60 @@ func MergeWithFullContent(base PageContent, full PageContentFull) PageContentFul
 	full.Request.Headers = base.Request.Headers
 	full.Request.Query = base.Request.Query
 
+	// 如果请求模式是 JSON 且现有的 request.params.json 为空，生成一个空的 JSON 示例
+	if base.Request.Params.Mode == "json" && (full.Request.Params.JSON == "" || strings.TrimSpace(full.Request.Params.JSON) == "") {
+		// 根据参数生成 JSON 示例
+		jsonExample := generateJSONExample(base.Request.Params.JSONDesc)
+		full.Request.Params.JSON = jsonExample
+	}
+
 	// 更新响应结构
 	full.Response.ResponseParamsDesc = base.Response.ResponseParamsDesc
 	full.Response.Remark = base.Response.Remark
 
 	return full
+}
+
+// generateJSONExample 根据参数描述生成 JSON 示例
+func generateJSONExample(params []Param) string {
+	if len(params) == 0 {
+		return "{}"
+	}
+
+	// 构建简单的 JSON 示例
+	var builder strings.Builder
+	builder.WriteString("{")
+
+	for i, param := range params {
+		if i > 0 {
+			builder.WriteString(",")
+		}
+		builder.WriteString("\n  ")
+		builder.WriteString(`"`)
+		builder.WriteString(param.Name)
+		builder.WriteString(`": `)
+
+		// 根据类型生成示例值
+		switch param.Type {
+		case "string":
+			builder.WriteString(`""`)
+		case "int", "long":
+			builder.WriteString("0")
+		case "float", "double":
+			builder.WriteString("0.0")
+		case "boolean":
+			builder.WriteString("false")
+		case "array":
+			builder.WriteString("[]")
+		case "object":
+			builder.WriteString("{}")
+		default:
+			builder.WriteString(`""`)
+		}
+	}
+
+	builder.WriteString("\n}")
+	return builder.String()
 }
 
 // CreateDefaultFullContent 创建默认的完整内容结构
